@@ -29,12 +29,14 @@ MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio"
           "agosto", "settembre", "ottobre", "novembre", "dicembre"]
 
 COMMANDS = [
-    ("prossima_sessione", "Prossima sessione F1 e MotoGP"),
-    ("qualifiche", "Prossime qualifiche"),
-    ("gara", "Prossime gare e sprint"),
-    ("weekend", "Weekend di gara F1 e MotoGP"),
-    ("f1", "Prossimo weekend F1"),
-    ("motogp", "Prossimo weekend MotoGP"),
+    ("f1_prossima", "F1: prossima sessione"),
+    ("f1_qualifiche", "F1: prossime qualifiche"),
+    ("f1_gara", "F1: prossima gara e sprint"),
+    ("f1_weekend", "F1: weekend completo"),
+    ("motogp_prossima", "MotoGP: prossima sessione"),
+    ("motogp_qualifiche", "MotoGP: prossime qualifiche"),
+    ("motogp_gara", "MotoGP: prossima gara e sprint"),
+    ("motogp_weekend", "MotoGP: weekend completo"),
     ("help", "Come funziona"),
 ]
 
@@ -43,7 +45,7 @@ KIND_LABEL = {
     "sprint": "sprint", "race": "gara", "warmup": "warm up",
 }
 QUALI_KINDS = {"quali", "sprint_quali"}
-RACE_KINDS = {"race", "sprint"}
+RACE_KINDS = {"race"}
 
 
 @dataclass
@@ -355,41 +357,54 @@ def errors_block(errors):
 
 # ----------------------------------------------------------------- comandi
 
-def next_matching(sessions, now, kinds=None):
-    out = []
-    for series in ("F1", "MotoGP"):
-        for s in sessions:
-            if s.series == series and s.start >= now and s.kind != "weekend" \
-                    and (kinds is None or s.kind in kinds):
-                out.append(s)
-                break
-    return out
+def next_matching(sessions, now, kinds, series):
+    for s in sessions:
+        if s.series == series and s.start >= now and s.kind != "weekend" \
+                and (kinds is None or s.kind in kinds):
+            return [s]
+    return []
+
+
+HELP_TEXT = (
+    "Ciao! Ti mando gli orari dei weekend di F1 e MotoGP (ora italiana).\n\n"
+    "Usa il pulsante <b>Menu</b> oppure scrivi:\n\n"
+    "🏎️ <b>F1</b>\n"
+    "/f1_prossima – prossima sessione\n"
+    "/f1_qualifiche – prossime qualifiche\n"
+    "/f1_gara – prossima gara (e sprint, se c'è)\n"
+    "/f1_weekend – weekend completo\n\n"
+    "🏍️ <b>MotoGP</b>\n"
+    "/motogp_prossima – prossima sessione\n"
+    "/motogp_qualifiche – prossime qualifiche\n"
+    "/motogp_gara – prossima gara (e sprint, se c'è)\n"
+    "/motogp_weekend – weekend completo"
+)
 
 
 def reply_for(cmd, sessions, errors):
     now = datetime.now(timezone.utc)
     if cmd in ("start", "help"):
-        return ("Ciao! Ti mando gli orari dei weekend F1 e MotoGP (ora italiana).\n\n"
-                "Usa il menu dei comandi (pulsante <b>Menu</b>) oppure scrivi:\n"
-                "/prossima_sessione – prossima sessione in assoluto\n"
-                "/qualifiche – prossime qualifiche\n"
-                "/gara – prossime gare e sprint\n"
-                "/weekend – weekend F1 e MotoGP\n"
-                "/f1 – weekend F1\n/motogp – weekend MotoGP")
-    if cmd in ("prossima_sessione", "qualifiche", "gara"):
-        kinds = {"qualifiche": QUALI_KINDS, "gara": RACE_KINDS}.get(cmd)
-        found = next_matching(sessions, now, kinds)
-        text = "\n\n".join(fmt_next(s, now) for s in found) or "Nessuna sessione in programma."
-        return text + errors_block(errors)
-    if cmd in ("weekend", "f1", "motogp"):
-        series = {"f1": ["F1"], "motogp": ["MotoGP"]}.get(cmd, ["F1", "MotoGP"])
-        blocks = []
-        for sr in series:
-            w = current_or_next(sessions, sr, now)
-            if w:
-                blocks.append(fmt_weekend(w, now))
-        return ("\n\n".join(blocks) or "Nessun weekend in programma.") + errors_block(errors)
-    return None
+        return HELP_TEXT
+    prefix, _, action = cmd.partition("_")
+    series = {"f1": "F1", "motogp": "MotoGP"}.get(prefix)
+    if not series or action not in ("prossima", "qualifiche", "gara", "weekend"):
+        return None
+    errs = [e for e in errors if e.startswith(series)]
+    if action == "weekend":
+        w = current_or_next(sessions, series, now)
+        text = fmt_weekend(w, now) if w else "Nessun weekend in programma."
+    else:
+        if action == "gara":
+            # prossima gara + sprint dello stesso weekend (se c'è e non è già passata)
+            found = next_matching(sessions, now, {"race"}, series)
+            sprint = next_matching(sessions, now, {"sprint"}, series)
+            if found and sprint and sprint[0].gp == found[0].gp:
+                found = sprint + found
+        else:
+            kinds = QUALI_KINDS if action == "qualifiche" else None
+            found = next_matching(sessions, now, kinds, series)
+        text ="\n\n".join(fmt_next(s, now) for s in found) or "Nessuna sessione in programma."
+    return text + errors_block(errs)
 
 
 def poll():
@@ -424,9 +439,8 @@ def poll():
             if cmd == "start":
                 set_commands()
             sessions, errors = (data() if cmd not in ("start", "help") else ([], []))
-            out = reply_for(cmd, sessions, errors)
-            if out:
-                send(chat, out)
+            out = reply_for(cmd, sessions, errors) or HELP_TEXT
+            send(chat, out)
         except Exception as e:  # noqa: BLE001
             print(f"Errore su /{cmd}: {e}")
     tg("getUpdates", offset=max(u["update_id"] for u in updates) + 1, timeout=0)
