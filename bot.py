@@ -161,7 +161,7 @@ def f1_from_races(races):
 
 
 def f1_sessions(year):
-    data = get_json(f"https://api.jolpi.ca/ergast/f1/{year}.json?limit=100")
+    data = get_json(f"https://api.jolpi.ca/ergast/f1/{year}.json?limit=100", tries=2, timeout=15)
     return f1_from_races(data["MRData"]["RaceTable"]["Races"])
 
 
@@ -209,7 +209,7 @@ def motogp_sessions(year, debug=False):
     events, host = None, None
     for h in MOTOGP_HOSTS:
         try:
-            events = get_json(f"{h}/motogp/v1/events?seasonYear={year}")
+            events = get_json(f"{h}/motogp/v1/events?seasonYear={year}", tries=2, timeout=10)
             host = h
             break
         except Exception as e:  # noqa: BLE001
@@ -223,18 +223,30 @@ def motogp_sessions(year, debug=False):
         print(f"[motogp] {len(events)} eventi; esempio chiavi: "
               f"{sorted(events[0].keys()) if events else '-'}")
 
-    out = []
+    # Servono solo i prossimi GP: evita decine di richieste inutili (e lente)
+    now = datetime.now(timezone.utc)
+    upcoming = []
     for ev in events:
         if ev.get("test"):
             continue
+        end = parse_dt(ev.get("date_end")) or parse_dt(ev.get("date_start"))
+        if end and end + timedelta(days=1) < now:
+            continue  # evento già concluso
+        upcoming.append(ev)
+    upcoming.sort(key=lambda e: parse_dt(e.get("date_start")) or now)
+    out = []
+    sessions_ok = True
+    for ev in upcoming[:3]:
         label = pick(ev, "sponsored_name", "name", "short_name") or "MotoGP"
         place = (ev.get("circuit") or {}).get("place") if isinstance(ev.get("circuit"), dict) else None
         gp = f"{label} ({place})" if place and place.lower() not in label.lower() else label
         found = []
-        for tpl in MOTOGP_SESSION_URLS:
+        failures = 0
+        for tpl in (MOTOGP_SESSION_URLS if sessions_ok else []):
             try:
-                items = get_json(tpl.format(h=host, id=ev.get("id")), tries=1)
+                items = get_json(tpl.format(h=host, id=ev.get("id")), tries=1, timeout=8)
             except Exception as e:  # noqa: BLE001
+                failures += 1
                 if debug:
                     print(f"[motogp] {tpl}: {e}")
                 continue
@@ -256,6 +268,8 @@ def motogp_sessions(year, debug=False):
                     found.append(Session("MotoGP", gp, nm.strip().title() or KIND_LABEL[kind], kind, dt))
             if found:
                 break
+        if failures == len(MOTOGP_SESSION_URLS):
+            sessions_ok = False  # endpoint sessioni non funziona: non insistere
         if found:
             out.extend(found)
         else:
@@ -275,6 +289,8 @@ def load_all(debug=False):
                        ("MotoGP", lambda y: motogp_sessions(y, debug))):
         got, err = [], None
         for y in years:
+            if y != years[0] and any(s.start >= now for s in got):
+                break  # l'anno dopo serve solo a fine stagione
             try:
                 got += fn(y)
             except Exception as e:  # noqa: BLE001
