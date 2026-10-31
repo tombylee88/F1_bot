@@ -13,6 +13,7 @@ Variabili d'ambiente: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (solo il tuo chat id).
 import html
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -55,6 +56,7 @@ class Session:
     name: str            # nome sessione (FP1, Qualifiche, Gara...)
     kind: str            # fp | quali | sprint_quali | sprint | race | warmup | weekend
     start: datetime      # sempre in UTC
+    end: object = None   # fine sessione/evento (UTC), se nota
 
 
 @dataclass
@@ -121,6 +123,8 @@ def parse_dt(value, time_part=None):
     if time_part:
         s = f"{s}T{str(time_part).strip()}"
     s = s.replace("Z", "+00:00")
+    if re.search(r"T.*[+-]\d{4}$", s):          # +0100 -> +01:00
+        s = s[:-2] + ":" + s[-2:]
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
@@ -166,35 +170,16 @@ def f1_sessions(year):
 
 
 # ----------------------------------------------------------------- fonte MotoGP
-# Fonte: API ufficiale MotoGP (PulseLive). La struttura esatta delle sessioni
-# non e' documentata ufficialmente: il codice e' tollerante e, se non trova gli
-# orari delle sessioni, mostra almeno le date del weekend. Usa "debug" per vedere
-# cosa risponde davvero.
+# Fonte: API MotoGP (PulseLive). Le sessioni ("broadcasts") sono dentro l'evento:
+#   /motogp/v1/events?seasonYear=ANNO   -> elenco eventi
+#   /motogp/v1/events/{id}              -> evento con broadcasts e categorie
+# Il formato e' dedotto da documentazione NON ufficiale: se qualcosa non torna,
+# lancia "debug" e guarda il log.
 
 MOTOGP_HOSTS = ["https://api.motogp.pulselive.com", "https://api.pulselive.motogp.com"]
-MOTOGP_SESSION_URLS = [
-    "{h}/motogp/v1/events/{id}/broadcasts",
-    "{h}/motogp/v1/broadcasts?eventUuid={id}",
-]
 
-
-def classify(name):
-    n = (name or "").lower()
-    if any(w in n for w in ("press", "conference", "media", "show", "briefing")):
-        return None
-    if "sprint" in n and "qualif" in n:
-        return "sprint_quali"
-    if "sprint" in n:
-        return "sprint"
-    if "warm" in n:
-        return "warmup"
-    if "qualif" in n or n.startswith("q1") or n.startswith("q2"):
-        return "quali"
-    if "practice" in n or n.startswith("fp") or n.startswith("p1") or n.startswith("p2"):
-        return "fp"
-    if "race" in n or "grand prix" in n or "gara" in n:
-        return "race"
-    return None
+SKIP_WORDS = ("press", "conference", "media", "briefing", "walk", "show",
+              "ceremony", "interview", "parade")
 
 
 def pick(d, *keys):
@@ -203,6 +188,64 @@ def pick(d, *keys):
         if v:
             return v
     return None
+
+
+def classify(kind, shortname, name):
+    text = f"{kind or ''} {shortname or ''} {name or ''}".lower()
+    sn = (shortname or "").lower()
+    if any(w in text for w in SKIP_WORDS):
+        return None
+    if "sprint" in text and "qualif" in text:
+        return "sprint_quali"
+    if "sprint" in text or sn == "spr":
+        return "sprint"
+    if "warm" in text or sn == "wup":
+        return "warmup"
+    if "qualif" in text or sn in ("q1", "q2"):
+        return "quali"
+    if "practice" in text or sn.startswith("fp") or sn == "pr":
+        return "fp"
+    if "race" in text or sn == "rac":
+        return "race"
+    return None
+
+
+def session_label(kind, shortname, name):
+    sn = (shortname or "").upper()
+    if kind == "fp":
+        if sn.startswith("FP"):
+            return sn
+        return "Practice" if sn == "PR" else "Prove libere"
+    if kind == "quali":
+        return {"Q1": "Qualifiche Q1", "Q2": "Qualifiche Q2"}.get(sn, "Qualifiche")
+    return {"sprint": "Sprint", "race": "Gara", "warmup": "Warm up",
+            "sprint_quali": "Qualifiche Sprint"}.get(kind, name or "Sessione")
+
+
+def is_motogp_class(b):
+    cat = b.get("category")
+    if isinstance(cat, dict):
+        acr = (cat.get("acronym") or "").upper()
+        nm = (cat.get("name") or "").replace("™", "").strip().lower()
+    else:
+        acr, nm = "", str(cat or "").replace("™", "").strip().lower()
+    if acr:
+        return acr == "MGP"
+    return nm == "motogp" if nm else True
+
+
+def event_broadcasts(ev, host, debug=False):
+    """Sessioni dell'evento. None = non riesco a leggerle (endpoint non risponde)."""
+    items = ev.get("broadcasts")
+    if not items:
+        try:
+            full = get_json(f"{host}/motogp/v1/events/{ev.get('id')}", tries=1, timeout=8)
+        except Exception as e:  # noqa: BLE001
+            if debug:
+                print(f"[motogp] evento {ev.get('id')}: {e}")
+            return None
+        items = full.get("broadcasts") if isinstance(full, dict) else None
+    return items or []
 
 
 def motogp_sessions(year, debug=False):
@@ -220,62 +263,53 @@ def motogp_sessions(year, debug=False):
     if isinstance(events, dict):
         events = events.get("events") or events.get("data") or []
     if debug:
-        print(f"[motogp] {len(events)} eventi; esempio chiavi: "
+        print(f"[motogp] {len(events)} eventi; chiavi esempio: "
               f"{sorted(events[0].keys()) if events else '-'}")
 
-    # Servono solo i prossimi GP: evita decine di richieste inutili (e lente)
     now = datetime.now(timezone.utc)
     upcoming = []
     for ev in events:
-        if ev.get("test"):
+        if str(ev.get("kind") or "").upper() == "TEST" or ev.get("test"):
             continue
         end = parse_dt(ev.get("date_end")) or parse_dt(ev.get("date_start"))
         if end and end + timedelta(days=1) < now:
             continue  # evento già concluso
         upcoming.append(ev)
     upcoming.sort(key=lambda e: parse_dt(e.get("date_start")) or now)
-    out = []
-    sessions_ok = True
+
+    out, fetch_ok = [], True
     for ev in upcoming[:3]:
-        label = pick(ev, "sponsored_name", "name", "short_name") or "MotoGP"
-        place = (ev.get("circuit") or {}).get("place") if isinstance(ev.get("circuit"), dict) else None
+        label = (pick(ev, "name", "sponsored_name", "short_name") or "MotoGP")
+        label = label.replace("™", "").replace("Grand Prix", "GP").strip()
+        circ = ev.get("circuit")
+        place = circ.get("place") if isinstance(circ, dict) else None
         gp = f"{label} ({place})" if place and place.lower() not in label.lower() else label
+
+        items = None
+        if fetch_ok:
+            items = event_broadcasts(ev, host, debug)
+            if items is None:
+                fetch_ok = False  # non insistere sugli altri eventi
         found = []
-        failures = 0
-        for tpl in (MOTOGP_SESSION_URLS if sessions_ok else []):
-            try:
-                items = get_json(tpl.format(h=host, id=ev.get("id")), tries=1, timeout=8)
-            except Exception as e:  # noqa: BLE001
-                failures += 1
-                if debug:
-                    print(f"[motogp] {tpl}: {e}")
+        for b in items or []:
+            if not is_motogp_class(b):
                 continue
-            if isinstance(items, dict):
-                items = items.get("broadcasts") or items.get("data") or []
-            if debug and items:
-                print(f"[motogp] {tpl}: {len(items)} voci; chiavi: {sorted(items[0].keys())}")
-            for b in items:
-                cat = b.get("category")
-                cat = (cat.get("name") if isinstance(cat, dict) else cat) or ""
-                if cat and "motogp" not in cat.lower():
-                    continue
-                if any(x in cat.lower() for x in ("moto2", "moto3", "e-")):
-                    continue
-                nm = pick(b, "name", "shortname", "short_name") or ""
-                kind = classify(nm) or classify(str(b.get("kind") or b.get("type") or ""))
-                dt = parse_dt(pick(b, "date_start", "start", "start_time", "datetime"))
-                if kind and dt:
-                    found.append(Session("MotoGP", gp, nm.strip().title() or KIND_LABEL[kind], kind, dt))
-            if found:
-                break
-        if failures == len(MOTOGP_SESSION_URLS):
-            sessions_ok = False  # endpoint sessioni non funziona: non insistere
+            kind = classify(b.get("kind"), b.get("shortname"), b.get("name"))
+            dt = parse_dt(pick(b, "date_start", "start", "start_time", "datetime"))
+            if debug:
+                print(f"[motogp]   {b.get('shortname')!r:8} {b.get('name')!r:28} "
+                      f"kind={b.get('kind')!r:12} -> {kind}  {dt}")
+            if kind and dt:
+                found.append(Session("MotoGP", gp, session_label(kind, b.get("shortname"), b.get("name")),
+                                     kind, dt, parse_dt(b.get("date_end"))))
         if found:
             out.extend(found)
-        else:
-            dt = parse_dt(ev.get("date_start"))
-            if dt:
-                out.append(Session("MotoGP", gp, "Weekend", "weekend", dt))
+        else:  # niente orari: almeno il weekend, valido fino alla fine dell'evento
+            start = parse_dt(ev.get("date_start"))
+            end = parse_dt(ev.get("date_end")) or start
+            if start:
+                out.append(Session("MotoGP", gp, "Weekend", "weekend", start,
+                                   end + timedelta(days=1)))
     return out
 
 
@@ -314,9 +348,13 @@ def weekends(sessions, series=None):
     return out
 
 
+def w_end(w):
+    return max((s.end or s.start) for s in w.sessions)
+
+
 def current_or_next(sessions, series, now):
     for w in weekends(sessions, series):
-        if w.sessions[-1].start >= now - timedelta(hours=3):
+        if w_end(w) >= now - timedelta(hours=3):
             return w
     return None
 
@@ -419,7 +457,13 @@ def reply_for(cmd, sessions, errors):
         else:
             kinds = QUALI_KINDS if action == "qualifiche" else None
             found = next_matching(sessions, now, kinds, series)
-        text ="\n\n".join(fmt_next(s, now) for s in found) or "Nessuna sessione in programma."
+        text = "\n\n".join(fmt_next(s, now) for s in found)
+        if not text:
+            w = current_or_next(sessions, series, now)
+            if w and all(s.kind == "weekend" for s in w.sessions):
+                text = f"Orari delle sessioni di {esc(w.gp)} non disponibili al momento."
+            else:
+                text = "Nessuna sessione in programma."
     return text + errors_block(errs)
 
 
@@ -474,7 +518,7 @@ def weekly(force=False):
     horizon = now + timedelta(days=5)
     blocks = []
     for w in weekends(sessions):
-        if w.sessions[-1].start >= now and w.sessions[0].start <= horizon:
+        if w_end(w) >= now and w.sessions[0].start <= horizon:
             blocks.append(fmt_weekend(w, now))
     if not blocks and not force and not errors:
         print("Nessun GP questo weekend: nessun messaggio.")
